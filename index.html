@@ -1,0 +1,452 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, updateDoc, getDoc, setDoc } from 'firebase/firestore';
+
+// Global variables for Firebase config and app ID
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase outside of the component to avoid re-initialization
+let app;
+let db;
+let auth;
+
+try {
+    app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+} catch (error) {
+    console.error("Error initializing Firebase:", error);
+    // Fallback or error message if Firebase fails to initialize
+}
+
+const App = () => {
+    const [messages, setMessages] = useState([]);
+    const [newMessage, setNewMessage] = useState('');
+    const [userId, setUserId] = useState(null);
+    const [userName, setUserName] = useState(''); // Initialize as empty
+    const [inputUserName, setInputUserName] = useState(''); // For the username input field
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [showUsernameModal, setShowUsernameModal] = useState(false); // State to control modal visibility
+    const [userStatuses, setUserStatuses] = useState({}); // Stores { userId: { userName, lastSeen } }
+    const [modalError, setModalError] = useState(''); // Stores error messages for the modal
+
+    const messagesEndRef = useRef(null);
+    const usernameInputRef = useRef(null); // Ref for username input for auto-focus
+
+    // Function to update user's last seen status in Firestore
+    const updateUserStatus = async (currentUserId, currentUserName) => {
+        if (!db || !currentUserId || !currentUserName) return;
+        const userStatusRef = doc(db, `artifacts/${appId}/public/data/user_statuses`, currentUserId);
+        try {
+            await setDoc(userStatusRef, {
+                userName: currentUserName,
+                lastSeen: serverTimestamp()
+            }, { merge: true });
+        } catch (error) {
+            console.error("Error updating user status:", error);
+        }
+    };
+
+    // Effect for Firebase Authentication and Initialization
+    useEffect(() => {
+        const setupFirebase = async () => {
+            if (!app || !db || !auth) {
+                console.error("Firebase not initialized correctly.");
+                return;
+            }
+
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Firebase authentication failed:", error);
+            }
+        };
+
+        setupFirebase();
+
+        const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+                // Try to fetch existing username
+                const userDocRef = doc(db, `artifacts/${appId}/users/${user.uid}/profile`, 'public');
+                const userDocSnap = await getDoc(userDocRef);
+                let fetchedUserName = `User-${user.uid.substring(0, 6)}`; // Default anonymous name
+                if (userDocSnap.exists() && userDocSnap.data().userName) {
+                    fetchedUserName = userDocSnap.data().userName;
+                } else {
+                    setShowUsernameModal(true); // Show modal if no username is set
+                }
+                setUserName(fetchedUserName);
+                setInputUserName(fetchedUserName); // Set input field to current/default name
+
+                // Update last seen immediately on auth
+                updateUserStatus(user.uid, fetchedUserName);
+
+                // Set up periodic last seen update
+                const intervalId = setInterval(() => {
+                    updateUserStatus(user.uid, fetchedUserName);
+                }, 60000); // Update every 60 seconds
+
+                return () => clearInterval(intervalId); // Clear interval on unmount
+            } else {
+                setUserId(null);
+                setUserName('Anonymous');
+            }
+            setIsAuthReady(true);
+        });
+
+        // Request notification permission
+        if ('Notification' in window && Notification.permission !== 'granted' && Notification.permission !== 'denied') {
+            Notification.requestPermission().then(permission => {
+                if (permission === 'granted') {
+                    console.log('Notification permission granted.');
+                } else {
+                    console.log('Notification permission denied.');
+                }
+            });
+        }
+
+        return () => {
+            unsubscribeAuth();
+        };
+    }, []); // Empty dependency array ensures this runs once on mount
+
+    // Effect for fetching messages and real-time updates
+    useEffect(() => {
+        if (!isAuthReady || !db || !userId) {
+            return; // Wait until authentication is ready and userId is set
+        }
+
+        const q = query(collection(db, `artifacts/${appId}/public/data/chats`), orderBy('timestamp'));
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const fetchedMessages = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+
+            // Identify new messages for notifications
+            const currentMessageIds = messages.map(msg => msg.id);
+            fetchedMessages.forEach(msg => {
+                // Check if message is new, not from current user, and notifications are granted
+                if (!currentMessageIds.includes(msg.id) && msg.senderId !== userId && Notification.permission === 'granted') {
+                    new Notification(`New message from ${msg.senderName || 'Someone'}`, {
+                        body: msg.text,
+                        icon: 'https://placehold.co/48x48/000000/FFFFFF?text=Chat', // Placeholder icon
+                    });
+                }
+            });
+
+            setMessages(fetchedMessages);
+
+            // Mark messages as read if they are visible in the viewport
+            fetchedMessages.forEach(async (msg) => {
+                if (msg.senderId !== userId && !msg.readBy?.includes(userId)) {
+                    const messageRef = doc(db, `artifacts/${appId}/public/data/chats`, msg.id);
+                    try {
+                        await updateDoc(messageRef, {
+                            readBy: [...(msg.readBy || []), userId]
+                        });
+                    } catch (error) {
+                        console.error("Error updating read status:", error);
+                    }
+                }
+            });
+        }, (error) => {
+            console.error("Error fetching messages:", error);
+        });
+
+        return () => unsubscribe();
+    }, [isAuthReady, userId, messages]); // Re-run when auth state changes or messages update for notification logic
+
+    // Effect for fetching all user statuses (for last seen)
+    useEffect(() => {
+        if (!isAuthReady || !db) {
+            return;
+        }
+
+        const userStatusesCollectionRef = collection(db, `artifacts/${appId}/public/data/user_statuses`);
+        const unsubscribe = onSnapshot(userStatusesCollectionRef, (snapshot) => {
+            const statuses = {};
+            snapshot.docs.forEach(doc => {
+                statuses[doc.id] = doc.data();
+            });
+            setUserStatuses(statuses);
+        }, (error) => {
+            console.error("Error fetching user statuses: Missing or insufficient permissions. Please check your Firebase Security Rules for 'artifacts/{appId}/public/data/user_statuses'.", error);
+        });
+
+        return () => unsubscribe();
+    }, [isAuthReady]);
+
+    // Scroll to the latest message whenever messages update
+    useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [messages]);
+
+    // Focus on username input when modal appears
+    useEffect(() => {
+        if (showUsernameModal && usernameInputRef.current) {
+            usernameInputRef.current.focus();
+        }
+    }, [showUsernameModal]);
+
+    const handleSendMessage = async (e) => {
+        e.preventDefault();
+        if (newMessage.trim() === '' || !userId || !userName) return;
+
+        try {
+            await addDoc(collection(db, `artifacts/${appId}/public/data/chats`), {
+                text: newMessage,
+                senderId: userId,
+                senderName: userName, // Use the user-provided name
+                timestamp: serverTimestamp(),
+                readBy: [userId] // Sender has read their own message
+            });
+            setNewMessage('');
+            updateUserStatus(userId, userName); // Update last seen when sending a message
+        } catch (error) {
+            console.error("Error sending message:", error);
+        }
+    };
+
+    const handleSaveUsername = async () => {
+        if (inputUserName.trim() === '') {
+            setModalError('Username cannot be empty!');
+            return;
+        }
+        if (!userId) {
+            console.error("User ID not available to save username.");
+            setModalError('User ID not available. Please try again.');
+            return;
+        }
+
+        try {
+            const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/profile`, 'public');
+            await setDoc(userDocRef, { userName: inputUserName }, { merge: true });
+            setUserName(inputUserName);
+            setShowUsernameModal(false); // Close modal after saving
+            setModalError(''); // Clear error on success
+            updateUserStatus(userId, inputUserName); // Update last seen with new username
+        } catch (error) {
+            console.error("Error saving username:", error);
+            setModalError('Failed to save username. Please try again.');
+        }
+    };
+
+    // Helper to check if a message is read by at least one other user
+    const isMessageReadByOthers = (message) => {
+        if (!message.readBy || message.senderId !== userId) return false; // Only show ticks on my sent messages
+        return message.readBy.some(readerId => readerId !== userId);
+    };
+
+    // Helper to format last seen timestamp
+    const formatLastSeen = (timestamp) => {
+        if (!timestamp) return 'Unknown';
+
+        const now = new Date();
+        const lastSeenDate = timestamp.toDate(); // Convert Firebase Timestamp to Date object
+        const diffSeconds = (now.getTime() - lastSeenDate.getTime()) / 1000;
+
+        if (diffSeconds < 120) { // Within 2 minutes, consider "Online"
+            return 'Online';
+        } else if (diffSeconds < 3600) { // Within 1 hour
+            const minutes = Math.floor(diffSeconds / 60);
+            return `Last seen ${minutes} min${minutes > 1 ? 's' : ''} ago`;
+        } else if (diffSeconds < 86400) { // Within 24 hours
+            const hours = Math.floor(diffSeconds / 3600);
+            return `Last seen ${hours} hour${hours > 1 ? 's' : ''} ago`;
+        } else {
+            // More than 24 hours, show date and time
+            return `Last seen ${lastSeenDate.toLocaleDateString()} at ${lastSeenDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+        }
+    };
+
+    if (!isAuthReady) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+                <div className="text-lg font-semibold">Loading chat...</div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="flex flex-col h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100 font-inter">
+            {/* Header */}
+            <header className="bg-gradient-to-r from-blue-500 to-purple-600 p-4 text-white shadow-lg rounded-b-xl">
+                <h1 className="text-2xl font-bold text-center">Live Chat</h1>
+                <p className="text-sm text-center mt-1">
+                    Logged in as: <span className="font-mono text-yellow-200">{userName}</span>
+                    <button
+                        onClick={() => setShowUsernameModal(true)}
+                        className="ml-3 px-3 py-1 bg-white text-blue-600 rounded-full text-xs font-semibold hover:bg-gray-100 transition duration-200 ease-in-out"
+                    >
+                        Change
+                    </button>
+                </p>
+                <p className="text-xs text-center mt-1">Your User ID: <span className="font-mono">{userId}</span></p>
+            </header>
+
+            {/* Chat Messages Area */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+                {messages.length === 0 && (
+                    <div className="text-center text-gray-500 dark:text-gray-400 mt-10">
+                        No messages yet. Say hello!
+                    </div>
+                )}
+                {messages.map((msg) => {
+                    const senderStatus = userStatuses[msg.senderId];
+                    const lastSeenText = senderStatus ? formatLastSeen(senderStatus.lastSeen) : 'Unknown';
+
+                    return (
+                        <div
+                            key={msg.id}
+                            className={`flex ${msg.senderId === userId ? 'justify-end' : 'justify-start'}`}
+                        >
+                            <div
+                                className={`max-w-xs sm:max-w-md p-3 rounded-xl shadow-md relative ${
+                                    msg.senderId === userId
+                                        ? 'bg-blue-500 text-white rounded-br-none'
+                                        : 'bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200 rounded-bl-none'
+                                }`}
+                            >
+                                <div className="font-semibold text-sm mb-1 flex justify-between items-center">
+                                    <span>{msg.senderId === userId ? 'You' : msg.senderName || 'Unknown User'}</span>
+                                    {msg.senderId !== userId && (
+                                        <span className="text-xs text-gray-400 dark:text-gray-400 ml-2">
+                                            ({lastSeenText})
+                                        </span>
+                                    )}
+                                </div>
+                                <p className="text-base break-words">{msg.text}</p>
+                                <div className="flex items-center justify-end text-xs mt-1 opacity-80">
+                                    {msg.timestamp && (
+                                        <span>
+                                            {new Date(msg.timestamp.toDate()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                        </span>
+                                    )}
+                                    {msg.senderId === userId && (
+                                        <span className="ml-1">
+                                            {/* Two ticks for read receipt */}
+                                            {isMessageReadByOthers(msg) ? (
+                                                <svg
+                                                    xmlns="http://www.w3.org/2000/svg"
+                                                    viewBox="0 0 24 24"
+                                                    fill="currentColor"
+                                                    className="w-4 h-4 text-green-300 inline-block"
+                                                >
+                                                    <path fillRule="evenodd" d="M19.966 11.033a.75.75 0 0 0-.298-.024c-.308.005-.62.062-.93.17C17.768 11.51 16.797 12 15.75 12c-1.213 0-2.38-.307-3.414-.89a27.554 27.554 0 0 0-.75-2.253.75.75 0 0 0-1.462-.119c-.38.87-.742 1.777-1.074 2.709L7.5 14.25a.75.75 0 0 0 0 1.5l1.594-.294c.573 1.077 1.222 2.067 1.933 2.943a.75.75 0 0 0 1.153.182l3.468-3.468a.75.75 0 0 0-.002-1.06Z" clipRule="evenodd" />
+                                                    <path fillRule="evenodd" d="M10.707 6.707a.75.75 0 0 0-1.06-1.06l-3.5 3.5a.75.75 0 0 0 0 1.06l6.25 6.25a.75.75 0 0 0 1.06 0l3.5-3.5a.75.75 0 0 0-1.06-1.06l-2.97 2.97-2.97-2.97Z" clipRule="evenodd" />
+                                                </svg>
+                                            ) : (
+                                                <svg
+                                                    xmlns="http://www.w3.org/2000/svg"
+                                                    viewBox="0 0 24 24"
+                                                    fill="currentColor"
+                                                    className="w-4 h-4 text-gray-300 inline-block"
+                                                >
+                                                    <path fillRule="evenodd" d="M19.966 11.033a.75.75 0 0 0-.298-.024c-.308.005-.62.062-.93.17C17.768 11.51 16.797 12 15.75 12c-1.213 0-2.38-.307-3.414-.89a27.554 27.554 0 0 0-.75-2.253.75.75 0 0 0-1.462-.119c-.38.87-.742 1.777-1.074 2.709L7.5 14.25a.75.75 0 0 0 0 1.5l1.594-.294c.573 1.077 1.222 2.067 1.933 2.943a.75.75 0 0 0 1.153.182l3.468-3.468a.75.75 0 0 0-.002-1.06Z" clipRule="evenodd" />
+                                                </svg>
+                                            )}
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })}
+                <div ref={messagesEndRef} /> {/* Scroll target */}
+            </div>
+
+            {/* Message Input Area */}
+            <form onSubmit={handleSendMessage} className="p-4 bg-gray-200 dark:bg-gray-800 shadow-inner rounded-t-xl">
+                <div className="flex items-center space-x-3">
+                    <input
+                        type="text"
+                        value={newMessage}
+                        onChange={(e) => setNewMessage(e.target.value)}
+                        placeholder="Type your message..."
+                        className="flex-1 p-3 rounded-full border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                    />
+                    <button
+                        type="submit"
+                        className="p-3 bg-blue-600 text-white rounded-full shadow-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition duration-200 ease-in-out transform hover:scale-105"
+                    >
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24"
+                            fill="currentColor"
+                            className="w-6 h-6"
+                        >
+                            <path d="M3.478 2.404a.75.75 0 0 0-.926.941l2.432 7.905H13.5a.75.75 0 0 1 0 1.5H4.984l-2.432 7.905a.75.75 0 0 0 .926.941 10.925 10.925 0 0 0 1.998-.407L19.5 18 8.008 3.404a10.925 10.925 0 0 0-4.53-.999Z" />
+                        </svg>
+                    </button>
+                </div>
+            </form>
+
+            {/* Username Modal */}
+            {showUsernameModal && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-xl w-full max-w-sm">
+                        <h2 className="text-xl font-bold mb-4 text-gray-900 dark:text-gray-100">Set Your Username</h2>
+                        <input
+                            type="text"
+                            value={inputUserName}
+                            onChange={(e) => setInputUserName(e.target.value)}
+                            placeholder="Enter your desired username"
+                            className="w-full p-3 mb-4 rounded-md border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                            ref={usernameInputRef} // Attach ref here
+                        />
+                        {modalError && (
+                            <p className="text-red-500 text-sm mb-3 text-center">{modalError}</p>
+                        )}
+                        <button
+                            onClick={handleSaveUsername}
+                            className="w-full p-3 bg-blue-600 text-white rounded-md shadow-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition duration-200 ease-in-out"
+                        >
+                            Save Username
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {/* Tailwind CSS CDN */}
+            <script src="https://cdn.tailwindcss.com"></script>
+            {/* Inter Font */}
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+            <style>
+                {`
+                body {
+                    font-family: 'Inter', sans-serif;
+                }
+                .custom-scrollbar::-webkit-scrollbar {
+                    width: 8px;
+                }
+                .custom-scrollbar::-webkit-scrollbar-track {
+                    background: #f1f1f1;
+                    border-radius: 10px;
+                }
+                .custom-scrollbar::-webkit-scrollbar-thumb {
+                    background: #888;
+                    border-radius: 10px;
+                }
+                .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+                    background: #555;
+                }
+                html {
+                    scroll-behavior: smooth;
+                }
+                `}
+            </style>
+        </div>
+    );
+};
+
+export default App;
